@@ -114,6 +114,7 @@ import warnings
 from typing import TYPE_CHECKING, Any, Dict, Generator, List, Optional, Tuple, Union
 
 import boto3
+import token_bucket
 import yaml
 from anyio.abc import TaskStatus
 from prefect.exceptions import InfrastructureNotAvailable, InfrastructureNotFound
@@ -122,6 +123,7 @@ from prefect.utilities.asyncutils import run_sync_in_worker_thread, sync_compati
 from prefect.utilities.dockerutils import get_prefect_image_name
 from prefect.utilities.pydantic import JsonPatch
 from pydantic import VERSION as PYDANTIC_VERSION
+from tenacity import retry, wait_fixed, wait_random
 
 if PYDANTIC_VERSION.startswith("2."):
     from pydantic.v1 import Field, root_validator, validator
@@ -161,6 +163,12 @@ POST_REGISTRATION_FIELDS = [
     "registeredBy",
     "deregisteredAt",
 ]
+
+storage = token_bucket.MemoryStorage()
+# reduce the bucket size by one
+limiter = token_bucket.Limiter(1, 30 - 1, storage)
+# init the bucket in storage
+limiter.consume("register_task_definition")
 
 
 def get_prefect_container(containers: List[dict]) -> Optional[dict]:
@@ -625,7 +633,7 @@ class ECSTask(Infrastructure):
             task_definition,
             is_new_task_definition,
         ) = await run_sync_in_worker_thread(
-            self._create_task_and_wait_for_start, boto_session, ecs_client
+            self._create_task_and_wait_for_start, boto_session, ecs_client, limiter
         )
 
         # Display a nice message indicating the command and image
@@ -735,7 +743,7 @@ class ECSTask(Infrastructure):
         return boto_session, ecs_client
 
     def _create_task_and_wait_for_start(
-        self, boto_session: boto3.Session, ecs_client: _ECSClient
+        self, boto_session: boto3.Session, ecs_client: _ECSClient, limiter
     ) -> Tuple[str, str, dict, bool]:
         """
         Register the task definition, create the task run, and wait for it to start.
@@ -796,7 +804,7 @@ class ECSTask(Infrastructure):
                     )
 
                 task_definition_arn = self._register_task_definition(
-                    ecs_client, task_definition
+                    ecs_client, task_definition, limiter
                 )
                 new_task_definition_registered = True
 
@@ -1245,8 +1253,9 @@ class ECSTask(Infrastructure):
         )
         return response["taskDefinition"]
 
+    @retry(wait=wait_fixed(1) + wait_random(0.01, 0.1))
     def _register_task_definition(
-        self, ecs_client: _ECSClient, task_definition: dict
+        self, ecs_client: _ECSClient, task_definition: dict, limiter
     ) -> str:
         """
         Register a new task definition with AWS.
@@ -1259,7 +1268,10 @@ class ECSTask(Infrastructure):
         for field in POST_REGISTRATION_FIELDS:
             task_definition_request.pop(field, None)
 
-        response = ecs_client.register_task_definition(**task_definition_request)
+        if limiter.consume("register_task_definition"):
+            response = ecs_client.register_task_definition(**task_definition_request)
+        else:
+            raise
         return response["taskDefinition"]["taskDefinitionArn"]
 
     def _prepare_task_definition(self, task_definition: dict, region: str) -> dict:
